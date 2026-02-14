@@ -47,14 +47,22 @@ def load_progress() -> Dict:
         return {"all_urls": [], "records": {}, "last_processed_index": -1}
 
     try:
-        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        raw_text = DATA_FILE.read_text(encoding="utf-8").strip()
+        if not raw_text:
+            return {"all_urls": [], "records": {}, "last_processed_index": -1}
+        data = json.loads(raw_text)
     except Exception:
+        return {"all_urls": [], "records": {}, "last_processed_index": -1}
+
+    # التأكد من أن البيانات عبارة عن قاموس (Dict) وليس قائمة (List)
+    if not isinstance(data, dict):
         return {"all_urls": [], "records": {}, "last_processed_index": -1}
 
     all_urls = data.get("all_urls", [])
     raw_records = data.get("records", [])
     records_map: Dict[str, Dict] = {}
 
+    # معالجة Records سواء كانت قاموساً أو قائمة
     if isinstance(raw_records, dict):
         for rec in raw_records.values():
             if isinstance(rec, dict) and rec.get("url"):
@@ -64,14 +72,11 @@ def load_progress() -> Dict:
             if isinstance(rec, dict) and rec.get("url"):
                 records_map[rec["url"]] = rec
 
-    raw_last_index = data.get("last_processed_index", -1)
-    if isinstance(raw_last_index, int):
-        last_processed_index = raw_last_index
-    else:
-        last_processed_index = infer_last_processed_index(all_urls, records_map)
-
+    last_processed_index = data.get("last_processed_index", -1)
+    
+    # تصحيح المؤشر لضمان عدم خروجه عن نطاق القائمة
     if all_urls:
-        last_processed_index = min(last_processed_index, len(all_urls) - 1)
+        last_processed_index = min(max(-1, last_processed_index), len(all_urls) - 1)
     else:
         last_processed_index = -1
 
@@ -154,28 +159,23 @@ def parse_bulk_urls(text: str) -> List[str]:
 
 
 def fetch_transcript_stage1(video_id: str) -> str:
-    # Compatibility across youtube-transcript-api versions.
     try:
         segments = YouTubeTranscriptApi.get_transcript(video_id, languages=["ar", "en", "en-US"])
         text = " ".join(seg.get("text", "").strip() for seg in segments if seg.get("text"))
         if text.strip():
             return text.strip()
-    except AttributeError:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id)
-        if hasattr(fetched, "to_raw_data"):
-            segments = fetched.to_raw_data()
-            text = " ".join(seg.get("text", "").strip() for seg in segments if seg.get("text"))
-            if text.strip():
-                return text.strip()
     except Exception:
         pass
 
-    segments = YouTubeTranscriptApi.get_transcript(video_id)
-    text = " ".join(seg.get("text", "").strip() for seg in segments if seg.get("text"))
-    if not text.strip():
-        raise RuntimeError("Empty transcript from youtube-transcript-api.")
-    return text.strip()
+    try:
+        segments = YouTubeTranscriptApi.get_transcript(video_id)
+        text = " ".join(seg.get("text", "").strip() for seg in segments if seg.get("text"))
+        if text.strip():
+            return text.strip()
+    except Exception as e:
+        raise RuntimeError(f"Transcript API failed: {e}")
+    
+    raise RuntimeError("Empty transcript from youtube-transcript-api.")
 
 
 def download_audio_stage2(url: str) -> Tuple[Path, Dict]:
@@ -231,14 +231,10 @@ def transcribe_with_groq(audio_path: Path, groq_api_key: str, model_name: str) -
         "temperature": 0,
         "response_format": "json",
     }
-    arabic_prompt = (
-        "Detect spoken language automatically. "
-        "If Arabic speech is present, transcribe it accurately in Arabic script. "
-        "Do not translate."
-    )
+    arabic_prompt = "Detect spoken language. If Arabic, transcribe in Arabic script."
     try:
         result = client.audio.transcriptions.create(prompt=arabic_prompt, **base_kwargs)
-    except TypeError:
+    except Exception:
         result = client.audio.transcriptions.create(**base_kwargs)
     finally:
         del audio_bytes
@@ -250,8 +246,6 @@ def transcribe_with_groq(audio_path: Path, groq_api_key: str, model_name: str) -
 
 
 def transcribe_with_hf(audio_path: Path, hf_api_key: str, model_name: str, max_retries: int = 3) -> str:
-    if not hf_api_key:
-        raise RuntimeError("HF_API_KEY is missing.")
     endpoint = f"https://api-inference.huggingface.co/models/{quote(model_name, safe='')}"
     headers = {"Authorization": f"Bearer {hf_api_key}", "Content-Type": "audio/m4a"}
     audio_bytes = audio_path.read_bytes()
@@ -275,18 +269,13 @@ def transcribe_with_hf(audio_path: Path, hf_api_key: str, model_name: str, max_r
 
             if isinstance(payload, dict):
                 text = str(payload.get("text", "")).strip()
-                if text:
-                    return text
+                if text: return text
             elif isinstance(payload, list):
-                joined = " ".join(
-                    str(item.get("text", "")).strip() for item in payload if isinstance(item, dict)
-                ).strip()
-                if joined:
-                    return joined
+                joined = " ".join(str(item.get("text", "")).strip() for item in payload if isinstance(item, dict)).strip()
+                if joined: return joined
 
-            if attempt < max_retries - 1:
-                time.sleep(3)
-        raise RuntimeError("Hugging Face returned empty transcription.")
+            if attempt < max_retries - 1: time.sleep(3)
+        raise RuntimeError("HF returned empty transcription.")
     finally:
         del audio_bytes
 
@@ -294,133 +283,78 @@ def transcribe_with_hf(audio_path: Path, hf_api_key: str, model_name: str, max_r
 def transcribe_with_gemini_audio(audio_path: Path, gemini_api_key: str, model_name: str) -> str:
     genai.configure(api_key=gemini_api_key)
     uploaded = genai.upload_file(path=str(audio_path))
-    prompt = (
-        "You are an accurate transcription engine. "
-        "Detect spoken language automatically. "
-        "If Arabic speech exists, transcribe it precisely in Arabic script. "
-        "Do not translate and do not summarize. Return plain text only."
-    )
+    prompt = "Transcribe the audio accurately. Detect Arabic language if present."
     try:
         model = GenerativeModel(model_name=model_name)
         response = model.generate_content([prompt, uploaded])
         text = (response.text or "").strip()
-        if not text:
-            raise RuntimeError("Gemini returned empty transcription.")
+        if not text: raise RuntimeError("Gemini empty response.")
         return text
     finally:
-        try:
-            genai.delete_file(uploaded.name)
-        except Exception:
-            pass
+        try: genai.delete_file(uploaded.name)
+        except Exception: pass
 
 
-def process_single_url(
-    url: str,
-    groq_api_key: str,
-    hf_api_key: str,
-    gemini_api_key: str,
-    groq_model: str,
-    hf_model: str,
-    gemini_model: str,
-) -> Dict:
+def process_single_url(url: str, groq_api_key: str, hf_api_key: str, gemini_api_key: str, groq_model: str, hf_model: str, gemini_model: str) -> Dict:
     started = utc_now_iso()
     video_id = extract_video_id(url)
     record = {
-        "url": url,
-        "video_id": video_id or "",
-        "title": "",
-        "status": "failed",
-        "method_used": "",
-        "transcript": "",
-        "error": "",
-        "started_at_utc": started,
-        "timestamp_utc": started,
+        "url": url, "video_id": video_id or "", "title": "", "status": "failed",
+        "method_used": "", "transcript": "", "error": "", "started_at_utc": started, "timestamp_utc": started,
     }
     if not video_id:
-        record["error"] = "Invalid YouTube URL or video id."
+        record["error"] = "Invalid URL."
         return record
 
     errors: List[str] = []
-    audio_path: Optional[Path] = None
-    title = ""
-
+    
+    # Stage 1: Official Transcript
     try:
         text = fetch_transcript_stage1(video_id)
-        record.update(
-            {
-                "status": "success",
-                "method_used": "youtube-transcript-api",
-                "transcript": text,
-                "timestamp_utc": utc_now_iso(),
-            }
-        )
+        record.update({"status": "success", "method_used": "youtube-transcript-api", "transcript": text, "timestamp_utc": utc_now_iso()})
         return record
     except Exception as exc:
-        errors.append(f"stage1: {exc}")
+        errors.append(f"Stage1: {exc}")
 
+    # Stage 2: Audio Download
+    audio_path = None
     try:
         audio_path, info = download_audio_stage2(url)
-        title = info.get("title", "") if isinstance(info, dict) else ""
-        record["title"] = title
+        record["title"] = info.get("title", "")
     except Exception as exc:
-        errors.append(f"stage2: {exc}")
+        errors.append(f"Stage2: {exc}")
         record["error"] = " | ".join(errors)
-        record["timestamp_utc"] = utc_now_iso()
         return record
 
+    # Stage 3: AI STT
     try:
-        try:
-            if groq_api_key:
+        # Try Groq
+        if groq_api_key:
+            try:
                 text = transcribe_with_groq(audio_path, groq_api_key, groq_model)
-                record.update(
-                    {
-                        "status": "success",
-                        "method_used": "groq",
-                        "transcript": text,
-                        "timestamp_utc": utc_now_iso(),
-                    }
-                )
+                record.update({"status": "success", "method_used": "groq", "transcript": text, "timestamp_utc": utc_now_iso()})
                 return record
-            errors.append("stage3/groq: missing GROQ_API_KEY")
-        except Exception as exc:
-            errors.append(f"stage3/groq: {exc}")
-
-        try:
-            if hf_api_key:
+            except Exception as e: errors.append(f"Groq: {e}")
+        
+        # Try HF
+        if hf_api_key:
+            try:
                 text = transcribe_with_hf(audio_path, hf_api_key, hf_model)
-                record.update(
-                    {
-                        "status": "success",
-                        "method_used": "huggingface-api",
-                        "transcript": text,
-                        "timestamp_utc": utc_now_iso(),
-                    }
-                )
+                record.update({"status": "success", "method_used": "huggingface", "transcript": text, "timestamp_utc": utc_now_iso()})
                 return record
-            errors.append("stage3/hf: missing HF_API_KEY")
-        except Exception as exc:
-            errors.append(f"stage3/hf: {exc}")
+            except Exception as e: errors.append(f"HF: {e}")
 
-        try:
-            if gemini_api_key:
+        # Try Gemini
+        if gemini_api_key:
+            try:
                 text = transcribe_with_gemini_audio(audio_path, gemini_api_key, gemini_model)
-                record.update(
-                    {
-                        "status": "success",
-                        "method_used": "gemini-audio",
-                        "transcript": text,
-                        "timestamp_utc": utc_now_iso(),
-                    }
-                )
+                record.update({"status": "success", "method_used": "gemini-audio", "transcript": text, "timestamp_utc": utc_now_iso()})
                 return record
-            errors.append("stage3/gemini: missing GEMINI_API_KEY")
-        except Exception as exc:
-            errors.append(f"stage3/gemini: {exc}")
+            except Exception as e: errors.append(f"Gemini: {e}")
     finally:
         cleanup_audio_files(audio_path, video_id)
 
     record["error"] = " | ".join(errors)
-    record["timestamp_utc"] = utc_now_iso()
     return record
 
 
@@ -431,423 +365,182 @@ def get_dashboard_stats(all_urls: List[str], records: Dict[str, Dict]) -> Dict[s
     failed = 0
     for url in all_urls:
         rec = records.get(url)
-        if not rec:
-            continue
+        if not rec: continue
         processed += 1
-        if rec.get("status") == "success":
-            success += 1
-        elif rec.get("status") == "failed":
-            failed += 1
-    success_rate = (success / processed * 100.0) if processed else 0.0
-    return {
-        "total": total,
-        "processed": processed,
-        "success": success,
-        "failed": failed,
-        "success_rate": success_rate,
-    }
+        if rec.get("status") == "success": success += 1
+        elif rec.get("status") == "failed": failed += 1
+    return {"total": total, "processed": processed, "success": success, "failed": failed, "success_rate": (success/processed*100 if processed else 0.0)}
 
 
-def pending_indices(all_urls: List[str], records: Dict[str, Dict], retry_failed: bool) -> List[int]:
+def ordered_resume_indices(all_urls: List[str], records: Dict[str, Dict], last_processed_index: int, retry_failed: bool) -> List[int]:
     indices = []
     for idx, url in enumerate(all_urls):
         rec = records.get(url)
-        if rec is None:
+        if rec is None or (retry_failed and rec.get("status") == "failed"):
             indices.append(idx)
-        elif retry_failed and rec.get("status") == "failed":
-            indices.append(idx)
-    return indices
-
-
-def ordered_resume_indices(
-    all_urls: List[str],
-    records: Dict[str, Dict],
-    last_processed_index: int,
-    retry_failed: bool,
-) -> List[int]:
-    if not all_urls:
-        return []
-    candidates = pending_indices(all_urls, records, retry_failed=retry_failed)
-    if not candidates:
-        return []
+    if not indices: return []
     start = (last_processed_index + 1) % len(all_urls) if last_processed_index >= 0 else 0
-    return sorted(candidates, key=lambda idx: (idx - start) % len(all_urls))
-
-
-def build_live_dataframe(all_urls: List[str], records: Dict[str, Dict]) -> pd.DataFrame:
-    rows = []
-    for url in all_urls:
-        rec = records.get(url, {})
-        rows.append(
-            {
-                "URL": url,
-                "Status": rec.get("status", "pending"),
-                "Method Used": rec.get("method_used", ""),
-                "Timestamp": rec.get("timestamp_utc", ""),
-            }
-        )
-    return pd.DataFrame(rows, columns=["URL", "Status", "Method Used", "Timestamp"])
+    return sorted(indices, key=lambda idx: (idx - start) % len(all_urls))
 
 
 def render_live_table(placeholder, all_urls: List[str], records: Dict[str, Dict]) -> None:
-    df = build_live_dataframe(all_urls, records)
-    placeholder.dataframe(df, use_container_width=True, height=340)
+    rows = []
+    for url in all_urls:
+        rec = records.get(url, {})
+        rows.append({"URL": url, "Status": rec.get("status", "pending"), "Method": rec.get("method_used", ""), "Time": rec.get("timestamp_utc", "")})
+    placeholder.dataframe(pd.DataFrame(rows), use_container_width=True, height=340)
 
 
 def build_markdown_report(success_records: List[Dict]) -> str:
-    lines = [
-        "# YouTube Bulk Transcript Report",
-        "",
-        f"Generated UTC: {utc_now_iso()}",
-        f"Total successful videos: {len(success_records)}",
-        "",
-    ]
+    lines = ["# YouTube Bulk Transcript Report", f"Generated: {utc_now_iso()}", ""]
     for idx, rec in enumerate(success_records, start=1):
-        title = rec.get("title") or rec.get("video_id") or "Untitled"
-        lines.append(f"## {idx}. {title}")
-        lines.append(f"- URL: {rec.get('url', '')}")
-        lines.append(f"- Method: {rec.get('method_used', '')}")
-        lines.append("")
-        lines.append(rec.get("transcript", ""))
-        lines.append("")
+        lines.extend([f"## {idx}. {rec.get('title', 'Untitled')}", f"- URL: {rec['url']}", f"- Method: {rec['method_used']}", "", rec['transcript'], ""])
     return "\n".join(lines)
-
-
-def contains_arabic(text: str) -> bool:
-    return bool(re.search(r"[\u0600-\u06FF]", text or ""))
 
 
 def markdown_to_pdf_bytes(markdown_text: str) -> Tuple[Optional[bytes], str]:
     try:
         from fpdf import FPDF
-    except Exception:
-        return None, "Install `fpdf2` to enable PDF export."
-
-    if not ARABIC_FONT_FILE.exists():
-        return None, "Missing `Amiri-Regular.ttf` in project root. Arabic PDF export requires this font."
-
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=12)
-    pdf.add_page()
-    try:
-        pdf.set_text_shaping(True)
-    except Exception:
-        pass
-    pdf.add_font("Amiri", "", str(ARABIC_FONT_FILE))
-    pdf.set_font("Amiri", size=13)
-
-    for raw_line in markdown_text.splitlines():
-        line = re.sub(r"^#{1,6}\s*", "", raw_line)
-        line = line.replace("**", "").replace("`", "")
-        line = line if line.strip() else " "
-        align = "R" if contains_arabic(line) else "L"
+    except: return None, "Install fpdf2."
+    if not ARABIC_FONT_FILE.exists(): return None, "Missing Font."
+    pdf = FPDF(); pdf.add_page()
+    try: pdf.set_text_shaping(True)
+    except: pass
+    pdf.add_font("Amiri", "", str(ARABIC_FONT_FILE)); pdf.set_font("Amiri", size=13)
+    for line in markdown_text.splitlines():
+        line = re.sub(r"^#{1,6}\s*", "", line).replace("**", "").replace("`", "") or " "
+        align = "R" if bool(re.search(r"[\u0600-\u06FF]", line)) else "L"
         pdf.multi_cell(0, 7, line, align=align)
-
-    result = pdf.output(dest="S")
-    if isinstance(result, (bytes, bytearray)):
-        return bytes(result), ""
-    return result.encode("latin-1"), ""
+    return bytes(pdf.output(dest="S")), ""
 
 
-def simple_query_chunks(records: List[Dict], question: str, max_chunks: int = 12) -> Tuple[str, List[str]]:
-    terms = set(re.findall(r"[a-zA-Z0-9\u0600-\u06FF]{3,}", question.lower()))
+def simple_query_chunks(records: List[Dict], question: str) -> Tuple[str, List[str]]:
+    terms = set(re.findall(r"[\w\u0600-\u06FF]{3,}", question.lower()))
     scored = []
-
     for rec in records:
         text = rec.get("transcript", "")
-        if not text:
-            continue
-        url = rec.get("url", "")
-        title = rec.get("title") or rec.get("video_id") or "Untitled"
-        chunk_size = 1700
-        step = 1400
-        for i in range(0, len(text), step):
-            chunk = text[i : i + chunk_size]
-            if not chunk:
-                continue
-            tokens = set(re.findall(r"[a-zA-Z0-9\u0600-\u06FF]{3,}", chunk.lower()))
-            score = len(terms.intersection(tokens)) if terms else 0
-            scored.append((score, chunk, url, title))
-
-    if not scored:
-        return "", []
-
+        for i in range(0, len(text), 1400):
+            chunk = text[i:i+1700]
+            score = len(terms.intersection(set(re.findall(r"[\w\u0600-\u06FF]{3,}", chunk.lower())))) if terms else 0
+            scored.append((score, chunk, rec['url'], rec.get('title', 'Video')))
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:max_chunks]
-    context_parts = []
-    sources = []
-    for _, chunk, url, title in top:
-        context_parts.append(f"[Source: {title} | {url}]\n{chunk}\n")
-        sources.append(url)
-    return "\n".join(context_parts)[:60000], list(dict.fromkeys(sources))
+    top = scored[:12]
+    return "\n".join(f"[Source: {t} | {u}]\n{c}" for _, c, u, t in top)[:60000], list(dict.fromkeys(u for _, _, u, _ in top))
 
 
 def ask_gemini_on_context(question: str, context: str, gemini_api_key: str, model_name: str) -> str:
-    if not gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is missing in Streamlit secrets.")
-    if not context.strip():
-        raise RuntimeError("No transcript context available.")
-
     genai.configure(api_key=gemini_api_key)
     model = GenerativeModel(model_name=model_name)
-    prompt = (
-        "Answer the question using only the provided transcript context. "
-        "If context is insufficient, say what is missing.\n\n"
-        f"Question:\n{question}\n\n"
-        f"Context:\n{context}\n"
-    )
-    response = model.generate_content(prompt)
-    return (response.text or "").strip()
+    prompt = f"Answer based ONLY on context:\nQuestion: {question}\n\nContext: {context}"
+    return (model.generate_content(prompt).text or "").strip()
 
 
-def process_urls_ui(
-    target_indices: List[int],
-    all_urls: List[str],
-    records: Dict[str, Dict],
-    groq_api_key: str,
-    hf_api_key: str,
-    gemini_api_key: str,
-    groq_model: str,
-    hf_model: str,
-    gemini_model: str,
-    live_table_placeholder,
-) -> None:
+def process_urls_ui(target_indices, all_urls, records, groq_api_key, hf_api_key, gemini_api_key, groq_model, hf_model, gemini_model, live_table_placeholder):
     total = len(target_indices)
-    if total == 0:
-        st.info("No URLs to process.")
-        return
-
     progress = st.progress(0.0)
     status_box = st.empty()
     success_count = 0
-    failed_count = 0
-
-    for idx, url_index in enumerate(target_indices, start=1):
-        url = all_urls[url_index]
-        record = process_single_url(
-            url=url,
-            groq_api_key=groq_api_key,
-            hf_api_key=hf_api_key,
-            gemini_api_key=gemini_api_key,
-            groq_model=groq_model,
-            hf_model=hf_model,
-            gemini_model=gemini_model,
-        )
+    
+    for idx, url_idx in enumerate(target_indices, start=1):
+        url = all_urls[url_idx]
+        record = process_single_url(url, groq_api_key, hf_api_key, gemini_api_key, groq_model, hf_model, gemini_model)
         records[url] = record
-        st.session_state.last_processed_index = url_index
-        save_progress(all_urls, records, st.session_state.last_processed_index)
-
-        if record.get("status") == "success":
-            success_count += 1
-        else:
-            failed_count += 1
-
+        st.session_state.last_processed_index = url_idx
+        save_progress(all_urls, records, url_idx)
+        if record["status"] == "success": success_count += 1
         progress.progress(idx / total)
-        status_box.info(
-            f"Processed {idx}/{total} this run | Success: {success_count} | Failed: {failed_count}"
-        )
+        status_box.info(f"Progress: {idx}/{total} | Successful: {success_count}")
         render_live_table(live_table_placeholder, all_urls, records)
-
-        if idx % 10 == 0:
-            gc.collect()
-        if idx < total:
-            time.sleep(RATE_LIMIT_SECONDS)
-
-    st.session_state.records = records
-    st.success(f"Run completed. Success={success_count}, Failed={failed_count}")
+        if idx % 10 == 0: gc.collect()
+        if idx < total: time.sleep(RATE_LIMIT_SECONDS)
+    st.success("Run completed.")
 
 
-def main() -> None:
-    st.set_page_config(page_title="Bulk YouTube Intelligence", layout="wide")
+def main():
+    st.set_page_config(page_title="Bulk YT Intel", layout="wide")
     st.title("Bulk YouTube Content Intelligence")
-    st.caption("Resumable 1,000-URL processing with fail-safe extraction and Arabic-ready exports.")
-
     init_state()
 
-    try:
-        groq_api_key = st.secrets["GROQ_API_KEY"]
-    except Exception:
-        groq_api_key = ""
-    try:
-        hf_api_key = st.secrets["HF_API_KEY"]
-    except Exception:
-        hf_api_key = ""
-    try:
-        gemini_api_key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        gemini_api_key = ""
+    g_api = st.secrets.get("GROQ_API_KEY", "")
+    h_api = st.secrets.get("HF_API_KEY", "")
+    gem_api = st.secrets.get("GEMINI_API_KEY", "")
 
     with st.sidebar:
-        st.subheader("Secrets Status")
-        st.write(f"GROQ_API_KEY: {'Loaded' if groq_api_key else 'Missing'}")
-        st.write(f"HF_API_KEY: {'Loaded' if hf_api_key else 'Missing'}")
-        st.write(f"GEMINI_API_KEY: {'Loaded' if gemini_api_key else 'Missing'}")
-        st.subheader("Model Settings")
-        groq_model = st.text_input("Groq STT model", value="whisper-large-v3")
-        hf_model = st.text_input("HF STT model", value="openai/whisper-large-v3")
-        gemini_model = st.text_input("Gemini model", value="gemini-1.5-flash")
-        st.caption("API keys are read from Streamlit secrets only.")
+        st.subheader("Settings")
+        st.write(f"Groq: {'✅' if g_api else '❌'}")
+        st.write(f"HF: {'✅' if h_api else '❌'}")
+        st.write(f"Gemini: {'✅' if gem_api else '❌'}")
+        g_mod = st.text_input("Groq Model", "whisper-large-v3")
+        h_mod = st.text_input("HF Model", "openai/whisper-large-v3")
+        gem_mod = st.text_input("Gemini Model", "gemini-1.5-flash")
 
     col1, col2 = st.columns([3, 2])
     with col1:
-        st.subheader("Bulk Input")
-        url_text = st.text_area(
-            "Paste up to 1000 YouTube URLs (one per line or comma-separated)",
-            height=250,
-            placeholder="https://www.youtube.com/watch?v=...\nhttps://youtu.be/...",
-        )
+        st.subheader("Input URLs")
+        url_text = st.text_area("Paste URLs", height=200)
         b1, b2 = st.columns(2)
-        if b1.button("Load / Replace URL List", use_container_width=True):
+        if b1.button("Replace List"):
             urls = parse_bulk_urls(url_text)
-            kept_records = {url: st.session_state.records[url] for url in urls if url in st.session_state.records}
+            st.session_state.records = {u: st.session_state.records[u] for u in urls if u in st.session_state.records}
             st.session_state.all_urls = urls
-            st.session_state.records = kept_records
-            st.session_state.last_processed_index = infer_last_processed_index(urls, kept_records)
-            save_progress(urls, kept_records, st.session_state.last_processed_index)
-            st.success(f"Loaded {len(urls)} normalized URLs.")
-
-        if b2.button("Append URLs", use_container_width=True):
+            st.session_state.last_processed_index = infer_last_processed_index(urls, st.session_state.records)
+            save_progress(urls, st.session_state.records, st.session_state.last_processed_index)
+            st.rerun()
+        if b2.button("Append"):
             urls = parse_bulk_urls(url_text)
             merged = list(dict.fromkeys(st.session_state.all_urls + urls))
             st.session_state.all_urls = merged
-            st.session_state.last_processed_index = infer_last_processed_index(merged, st.session_state.records)
             save_progress(merged, st.session_state.records, st.session_state.last_processed_index)
-            st.success(f"Added {len(urls)} URLs. Total tracked: {len(merged)}")
+            st.rerun()
 
     with col2:
-        st.subheader("Storage")
-        st.write(f"`{DATA_FILE.resolve()}`")
-        st.write(f"`{CSV_FILE.resolve()}`")
-        if st.button("Reload Progress From Disk", use_container_width=True):
-            payload = load_progress()
-            st.session_state.all_urls = payload.get("all_urls", [])
-            st.session_state.records = payload.get("records", {})
-            st.session_state.last_processed_index = payload.get("last_processed_index", -1)
-            st.success("Progress reloaded from disk.")
-
-        next_resume_index = st.session_state.last_processed_index + 1
-        st.info(f"Last processed index: {st.session_state.last_processed_index}")
-        st.info(f"Resume index: {next_resume_index}")
+        st.subheader("Status")
+        st.write(f"Current Index: {st.session_state.last_processed_index}")
+        if st.button("Reload from Disk"):
+            st.session_state.initialized = False
+            st.rerun()
 
     st.divider()
     stats = get_dashboard_stats(st.session_state.all_urls, st.session_state.records)
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total URLs", int(stats["total"]))
+    m1.metric("Total", int(stats["total"]))
     m2.metric("Processed", int(stats["processed"]))
-    m3.metric("Failed", int(stats["failed"]))
-    m4.metric("Success Rate", f"{stats['success_rate']:.2f}%")
+    m3.metric("Success", int(stats["success"]))
+    m4.metric("Rate", f"{stats['success_rate']:.1f}%")
 
-    st.subheader("Live Processing Table")
-    live_table_placeholder = st.empty()
-    render_live_table(live_table_placeholder, st.session_state.all_urls, st.session_state.records)
+    table_p = st.empty()
+    render_live_table(table_p, st.session_state.all_urls, st.session_state.records)
 
-    st.subheader("Processing Controls")
-    retry_failed = st.checkbox("Include failed URLs in resume run", value=False)
-    resume_indices = ordered_resume_indices(
-        st.session_state.all_urls,
-        st.session_state.records,
-        st.session_state.last_processed_index,
-        retry_failed=retry_failed,
-    )
-    st.write(f"Pending URLs in resume order: **{len(resume_indices)}**")
+    st.subheader("Controls")
+    retry = st.checkbox("Retry Failed")
+    indices = ordered_resume_indices(st.session_state.all_urls, st.session_state.records, st.session_state.last_processed_index, retry)
+    st.write(f"Pending: {len(indices)}")
 
     p1, p2 = st.columns(2)
-    if p1.button(f"Resume Next Batch ({BATCH_SIZE})", use_container_width=True):
-        if not st.session_state.all_urls:
-            st.warning("Load URLs first.")
-        elif not resume_indices:
-            st.info("No pending URLs to process.")
-        else:
-            process_urls_ui(
-                target_indices=resume_indices[:BATCH_SIZE],
-                all_urls=st.session_state.all_urls,
-                records=st.session_state.records,
-                groq_api_key=groq_api_key,
-                hf_api_key=hf_api_key,
-                gemini_api_key=gemini_api_key,
-                groq_model=groq_model,
-                hf_model=hf_model,
-                gemini_model=gemini_model,
-                live_table_placeholder=live_table_placeholder,
-            )
-
-    if p2.button("Resume All Remaining", use_container_width=True):
-        if not st.session_state.all_urls:
-            st.warning("Load URLs first.")
-        elif not resume_indices:
-            st.info("No pending URLs to process.")
-        else:
-            process_urls_ui(
-                target_indices=resume_indices,
-                all_urls=st.session_state.all_urls,
-                records=st.session_state.records,
-                groq_api_key=groq_api_key,
-                hf_api_key=hf_api_key,
-                gemini_api_key=gemini_api_key,
-                groq_model=groq_model,
-                hf_model=hf_model,
-                gemini_model=gemini_model,
-                live_table_placeholder=live_table_placeholder,
-            )
+    if p1.button(f"Process Batch ({BATCH_SIZE})"):
+        process_urls_ui(indices[:BATCH_SIZE], st.session_state.all_urls, st.session_state.records, g_api, h_api, gem_api, g_mod, h_mod, gem_mod, table_p)
+    if p2.button("Process All"):
+        process_urls_ui(indices, st.session_state.all_urls, st.session_state.records, g_api, h_api, gem_api, g_mod, h_mod, gem_mod, table_p)
 
     st.divider()
-    st.subheader("Download Center")
-    success_records = [
-        rec for rec in st.session_state.records.values() if rec.get("status") == "success" and rec.get("transcript")
-    ]
-    if success_records:
-        markdown_report = build_markdown_report(success_records)
-        st.download_button(
-            label="Download Markdown Report",
-            data=markdown_report.encode("utf-8"),
-            file_name="youtube_bulk_report.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-        pdf_bytes, pdf_error = markdown_to_pdf_bytes(markdown_report)
-        if pdf_bytes:
-            st.download_button(
-                label="Download PDF Report (Arabic Ready)",
-                data=pdf_bytes,
-                file_name="youtube_bulk_report.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-        else:
-            st.warning(pdf_error)
-    else:
-        st.info("No successful transcripts available yet.")
-
-    st.divider()
-    st.subheader("Ask Gemini About Processed Videos")
-    question = st.text_input("Ask a question over all extracted transcripts")
-    if st.button("Ask", use_container_width=True):
-        if not question.strip():
-            st.warning("Enter a question first.")
-        elif not success_records:
-            st.warning("No successful transcripts available yet.")
-        else:
-            context, sources = simple_query_chunks(success_records, question)
-            try:
-                answer = ask_gemini_on_context(
-                    question=question,
-                    context=context,
-                    gemini_api_key=gemini_api_key,
-                    model_name=gemini_model,
-                )
-                st.session_state.chat_history.append(
-                    {"question": question, "answer": answer, "sources": sources, "at": utc_now_iso()}
-                )
-            except Exception as exc:
-                st.error(f"Gemini query failed: {exc}")
-
-    if st.session_state.chat_history:
-        for item in reversed(st.session_state.chat_history[-10:]):
-            st.markdown(f"**Q:** {item['question']}")
-            st.markdown(f"**A:** {item['answer']}")
-            if item.get("sources"):
-                st.caption("Sources: " + ", ".join(item["sources"][:8]))
-            st.markdown("---")
+    success_recs = [r for r in st.session_state.records.values() if r.get("status") == "success"]
+    if success_recs:
+        report = build_markdown_report(success_recs)
+        st.download_button("Download MD", report.encode("utf-8"), "report.md")
+        pdf, err = markdown_to_pdf_bytes(report)
+        if pdf: st.download_button("Download PDF", pdf, "report.pdf")
+        else: st.warning(err)
+        
+        st.subheader("Chat with Videos")
+        q = st.text_input("Question")
+        if st.button("Ask Gemini") and q:
+            ctx, srcs = simple_query_chunks(success_recs, q)
+            ans = ask_gemini_on_context(q, ctx, gem_api, gem_mod)
+            st.session_state.chat_history.append({"q": q, "a": ans, "s": srcs})
+            for chat in reversed(st.session_state.chat_history):
+                st.write(f"**Q:** {chat['q']}\n\n**A:** {chat['a']}")
+                st.caption(f"Sources: {chat['s']}")
+                st.divider()
 
 
 if __name__ == "__main__":
