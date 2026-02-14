@@ -1,0 +1,7 @@
+streamlit
+google-generativeai
+yt-dlp
+groq
+fpdf2
+pandas
+youtube-transcript-api
