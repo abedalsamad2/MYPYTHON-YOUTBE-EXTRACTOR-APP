@@ -1,6 +1,6 @@
 streamlit
 google-generativeai
-yt-dlp
+yt-dlp>=2025.01.26
 groq
 fpdf2
 pandas
